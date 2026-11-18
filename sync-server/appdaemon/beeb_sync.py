@@ -9,6 +9,8 @@ apps.yaml:
 
 Endpoint for Beeb › Settings › Household sync:  http://<home-assistant-address>:5050/api/appdaemon/beeb_history
 Data is kept in beeb_history.json next to this file. See docs/SYNC.md.
+Optional args: endpoint (default beeb_history) and data_file (default <endpoint>.json) — e.g. a second instance with
+endpoint: telly_history serves the Telly app separately, so the two apps' data never mix.
 (The merge logic is the same as sync-server/beeb_sync_core.py, inlined here so this stays one file.)
 """
 import json
@@ -30,11 +32,13 @@ class BeebSync(hass.Hass):
         self.key = str(self.args["key"])
         if len(self.key) < 16:
             self.log("Beeb sync: please use a key of at least 16 characters", level="WARNING")
-        self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "beeb_history.json")
+        endpoint = str(self.args.get("endpoint", "beeb_history"))
+        data_file = str(self.args.get("data_file", endpoint + ".json"))
+        self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.path.basename(data_file))
         self.lock = threading.Lock()
-        self.register_endpoint(self.handle, "beeb_history")
+        self.register_endpoint(self.handle, endpoint)
         data = self.load()
-        self.log(f"Beeb sync ready: {({p: {k: len(v['records']) for k, v in ks.items()} for p, ks in data['profiles'].items()})}")
+        self.log(f"Beeb sync ready on /api/appdaemon/{endpoint}: {({p: {k: len(v['records']) for k, v in ks.items()} for p, ks in data['profiles'].items()})}")
 
     def load(self):
         try:

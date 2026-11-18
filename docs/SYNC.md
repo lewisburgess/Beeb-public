@@ -35,6 +35,16 @@ You'll also need a **key**: a long random password shared by the server and your
      class: BeebSync
      key: "your-long-random-key"
    ```
+   Running the **Telly** app as well? Add a second instance with its own endpoint so the apps' data stays separate:
+
+   ```yaml
+   telly_sync:
+     module: beeb_sync
+     class: BeebSync
+     key: "your-long-random-key"
+     endpoint: telly_history
+   ```
+   and use `…/api/appdaemon/telly_history` in Telly.
 4. **Check the log.** AppDaemon reloads apps automatically. Its log (**Settings › Add-ons › AppDaemon › Log**)
    should show `Beeb sync ready`.
 5. **Connect each Apple TV.** In Beeb, **Settings › Household sync**: enter
