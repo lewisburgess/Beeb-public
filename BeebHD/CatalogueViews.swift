@@ -31,6 +31,7 @@ struct HomeView: View {
     @StateObject private var homeState = HomeState()
     @StateObject private var navigationMemory = NavigationFocusMemory()
     @State private var liveLaunch: LiveLaunch?
+    @State private var shelfLink: TopShelfLinkRequest?
     @FocusState private var focusedTab: BeebTab?
     @FocusState private var menuIconFocused: Bool
     @State private var sidebarOpen = false
@@ -225,7 +226,10 @@ struct HomeView: View {
             }).overlay(alignment: .topLeading) {
                 if usesSidebar && sidebarOpen { sidebar.transition(.move(edge: .leading).combined(with: .opacity)) }
             }
-        }.id(liveLaunch?.id).environmentObject(history).tint(.pink)
+        }.id("\(liveLaunch?.id.uuidString ?? "")-\(shelfLink?.id.uuidString ?? "")").environmentObject(history).tint(.pink)
+        .overlay { TopShelfLinkHost(request: shelfLink, catalogue: catalogue, library: library).environmentObject(history).tint(.pink) }
+        .onReceive(library.$saved) { TopShelfPublisher.publish(saved: $0, records: history.records) }
+        .onReceive(history.$records) { TopShelfPublisher.publish(saved: library.saved, records: $0) }
         .task(id: iconFocusRequest) {
             guard iconFocusRequest > 0 else { return }
             do { try await Task.sleep(nanoseconds: 150_000_000) } catch { return }
@@ -249,6 +253,11 @@ struct HomeView: View {
         .onChange(of: modernNavigation) { _, _ in sidebarOpen = false; focusedTab = nil; menuIconFocused = false }
         .onOpenURL { url in
             sidebarOpen = false
+            if let link = BeebLink.parse(url) {
+                NotificationCenter.default.post(name: .beebLaunchLive, object: nil)
+                shelfLink = TopShelfLinkRequest(link: link)
+                return
+            }
             guard let id = LiveChannelLink.channelID(from: url) else { return }
             if tab != .live { NotificationCenter.default.post(name: .beebLaunchLive, object: nil) }
             liveLaunch = LiveLaunch(channelID: id)
@@ -803,6 +812,8 @@ struct CatalogueShowView: View {
         return ProfileStore.shared.kidsMode ? episodes.filter { ($0.programme.guidance ?? "").isEmpty } : episodes
     }
     var visibleEpisodes: [CatalogueEpisode] { Array(selectedEpisodes.dropFirst((state.episodePage - 1) * 30).prefix(30)) }
+    /// Series and paging controls sit between the header and the grid; Up must reach them rather than jump to Saved.
+    var hasControlsAboveGrid: Bool { orderedSeries.count > 1 || selectedEpisodes.count > 30 }
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         ScrollView {
@@ -841,7 +852,7 @@ struct CatalogueShowView: View {
                         Button("Previous episodes") { state.episodePage -= 1 }.disabled(state.episodePage <= 1)
                         Text("Episodes \((state.episodePage - 1) * 30 + 1)–\(min(state.episodePage * 30, selectedEpisodes.count))")
                         Button("More episodes") { state.episodePage += 1 }.disabled(state.episodePage * 30 >= selectedEpisodes.count)
-                    }
+                    }.frame(maxWidth: .infinity, alignment: .leading).focusSection()
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: 36)], spacing: 30) {  // 4 columns (3 in sidebar layout)
                     ForEach(visibleEpisodes) { episode in
@@ -855,7 +866,7 @@ struct CatalogueShowView: View {
                     }
                 }
                 .background(alignment: .top) {
-                    WideBookmarkFocusGuide(destination: bookmarkFocus, enabled: orderedSeries.count <= 1 && visibleEpisodes.prefix(episodeColumns).contains { $0.id == focusedEpisode })
+                    WideBookmarkFocusGuide(destination: bookmarkFocus, enabled: !hasControlsAboveGrid && visibleEpisodes.prefix(episodeColumns).contains { $0.id == focusedEpisode })
                         .frame(height: 24).offset(y: -26)
                 }
                 if state.show != nil && selectedEpisodes.isEmpty { Text("No episodes are currently available.").foregroundStyle(.secondary) }
@@ -912,7 +923,7 @@ struct LiveView: View {
     var launch: LiveLaunch? = nil
     var library: Library? = nil
     @State private var selectedChannel: String?
-    @State private var guides: [String: ChannelGuide] = [:]
+    @State private var guides: [String: ChannelFeatured] = [:]
     @State private var detail: Programme?
     @FocusState private var stripFocus: String?
     @AppStorage("offerLiveFromStart") private var offerFromStart = false
@@ -930,17 +941,26 @@ struct LiveView: View {
     @Environment(\.scenePhase) private var phase
     @StateObject private var state = LiveState()
     @StateObject private var playback = PlaybackModel()
-    var body: some View {
+    @EnvironmentObject private var history: WatchHistory
+    @AppStorage("liveMode") private var liveMode = "Channels"
+    private var visibleChannels: [LiveChannel] { state.channels.filter { !profileStore.kidsMode || Self.kidsChannels.contains($0.id) } }
+    @ViewBuilder private var header: some View {
+        // Leading edge, directly beneath the navigation button: Down reaches it from the top-left
+        // corner and Down again enters the page. It stays put when the mode changes.
+        BeebNavigationSegments(title: "Live view", options: ["Channels", "Guide"], selection: $liveMode).frame(width: 520)
+        if state.channels.isEmpty && state.error == nil { ProgressView("Getting channels…") }
+        if let error = state.error { Text(error).foregroundStyle(.orange); Button("Retry channels") { state.retry += 1 } }
+        if let error = playback.error { Text(error).foregroundStyle(.orange) }
+        if playback.loading { HStack { ProgressView("Connecting to live channel…"); Button("Cancel") { playback.stop() } } }
+    }
+    @ViewBuilder private var channelsPage: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 30) {
-                if state.channels.isEmpty && state.error == nil { ProgressView("Getting channels…") }
-                if let error = state.error { Text(error).foregroundStyle(.orange); Button("Retry channels") { state.retry += 1 } }
-                if let error = playback.error { Text(error).foregroundStyle(.orange) }
-                if playback.loading { HStack { ProgressView("Connecting to live channel…"); Button("Cancel") { playback.stop() } } }
+                header
                 // channel strip
                 ScrollView(.horizontal) {
                     HStack(spacing: 6) {
-                        ForEach(state.channels.filter { !profileStore.kidsMode || Self.kidsChannels.contains($0.id) }) { channel in
+                        ForEach(visibleChannels) { channel in
                             Button { play(channel) } label: {
                                 Text(ChannelWordmark.style(id: channel.id, title: channel.title).label)
                             }.buttonStyle(ChannelStripStyle(id: channel.id, title: channel.title, selected: currentChannelID == channel.id))
@@ -948,7 +968,7 @@ struct LiveView: View {
                         }
                     }.padding(.vertical, 20).padding(.horizontal, 8)
                 }.scrollClipDisabled().focusSection()
-                if let channel = state.channels.filter { !profileStore.kidsMode || Self.kidsChannels.contains($0.id) }.first(where: { $0.id == currentChannelID }) {
+                if let channel = visibleChannels.first(where: { $0.id == currentChannelID }) {
                     let guide = guides[channel.id]
                     let hide = profileStore.kidsMode
                     ScrollView(.horizontal) {
@@ -984,6 +1004,26 @@ struct LiveView: View {
         .task(id: currentChannelID) {
             guard let id = currentChannelID, guides[id] == nil else { return }
             guides[id] = await ChannelGuideAPI.load(id)
+        }
+    }
+    var body: some View {
+        Group {
+            if liveMode == "Guide" {
+                // The guide scrolls itself, keeping its programme panel in view.
+                VStack(alignment: .leading, spacing: 24) {
+                    header
+                    ChannelGuideView(channels: visibleChannels,
+                                     playLive: { play($0) },
+                                     playEpisode: { programme in
+                                         if profileStore.kidsMode && !(programme.guidance ?? "").isEmpty {
+                                             state.error = "This programme isn't available on a kids profile."; return
+                                         }
+                                         playback.start(programme, history: history) { state.playing = true }
+                                     })
+                }.padding(.horizontal, 60).padding(.top, 24)
+            } else {
+                channelsPage
+            }
         }
         .sheet(item: $detail) { programme in if let library { DetailView(programme: programme, library: library) } }
         .confirmationDialog(askFromStart.map { $0.current?.title ?? $0.title } ?? "",
@@ -1039,6 +1079,7 @@ struct SettingsView: View {
     @AppStorage("modernNavigation") private var modernNavigation = "Sidebar"
     @AppStorage("bbcOneRegion") private var bbcOne = "bbc_one_london"
     @AppStorage("bbcTwoRegion") private var bbcTwo = "bbc_two_england"
+    @AppStorage(TopShelfShared.sourceKey, store: TopShelfShared.defaults) private var topShelfSource = TopShelfSource.fallback.rawValue
     @ObservedObject private var profileStore = ProfileStore.shared
     @AppStorage(BeebSyncSettings.urlKey) private var syncURL = ""
     @AppStorage(BeebSyncSettings.secretKey) private var syncSecret = ""
@@ -1127,6 +1168,17 @@ struct SettingsView: View {
                     }
                 }.padding(32).frame(maxWidth: .infinity, alignment: .leading)
                     .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 24))
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Top Shelf").font(.system(size: 32, weight: .bold))
+                    Text("What appears above the Home Screen when Beeb is in your top row.").font(.system(size: 22)).foregroundStyle(.secondary)
+                    BeebNavigationSegments(title: "Top Shelf", options: TopShelfSource.allCases.map(\.rawValue), selection: $topShelfSource)
+                        .frame(width: 1200).accessibilityIdentifier("TopShelfPicker")
+                    Text("Mix shows Continue Watching, Saved and Live TV together. If the list you choose is empty, Live TV is shown instead.")
+                        .font(.system(size: 22)).foregroundStyle(.secondary)
+                }.padding(32).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 24))
+                    .focusSection()
+                    .onChange(of: topShelfSource) { _, _ in TVTopShelfContentProvider.topShelfContentDidChange() }
                 Toggle("Offer watch from start for live TV", isOn: $offerLiveFromStart)
                 Text("When on, opening a channel part-way through a programme asks whether to watch from the start or live. When off, live TV always starts live. You can also jump back with Watch from start in the player.")
                     .font(.system(size: 22)).foregroundStyle(.secondary)
@@ -1444,20 +1496,20 @@ struct KidsHomeView: View {
 }
 
 // data + views
-struct ChannelGuide {
+struct ChannelFeatured {
     struct Row: Identifiable { let id: String; let title: String; let episodes: [CatalogueEpisode] }
     var featured: [CatalogueEpisode] = []
     var rows: [Row] = []
 }
 enum ChannelGuideAPI {
-    static func load(_ channelID: String) async -> ChannelGuide {
-        guard channelID.range(of: "^[a-z0-9_]+$", options: .regularExpression) != nil else { return ChannelGuide() }
+    static func load(_ channelID: String) async -> ChannelFeatured {
+        guard channelID.range(of: "^[a-z0-9_]+$", options: .regularExpression) != nil else { return ChannelFeatured() }
         let api = DiscoveryAPI()
         func json(_ path: String) async -> [String: Any]? {
             guard let url = URL(string: "https://ibl.api.bbc.co.uk/ibl/v1/" + path), let data = try? await api.fetch(url) else { return nil }
             return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         }
-        var guide = ChannelGuide()
+        var guide = ChannelFeatured()
         guard let elements = ((await json("channels/\(channelID)/highlights"))?["channel_highlights"] as? [String: Any])?["elements"] as? [[String: Any]] else { return guide }
         var groups: [(String, String)] = []
         for element in elements {
